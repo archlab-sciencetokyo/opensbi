@@ -33,7 +33,14 @@ static struct plic_data plic = {
     .size = PLATFORM_PLIC_SIZE,
     .num_src = PLATFORM_PLIC_NUM_SOURCES,
 	.context_map = {
-		[0] = { 0, 1 },
+		[0] = {  0,  1 },
+		[1] = {  2,  3 },
+		[2] = {  4,  5 },
+		[3] = {  6,  7 },
+		[4] = {  8,  9 },
+		[5] = { 10, 11 },
+		[6] = { 12, 13 },
+		[7] = { 14, 15 },
 	},
 };
 
