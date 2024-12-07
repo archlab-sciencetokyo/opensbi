@@ -21,7 +21,7 @@
 #define PLATFORM_PLIC_ADDR          0xc000000
 #define PLATFORM_PLIC_SIZE          (0x200000 + (PLATFORM_HART_COUNT * 0x1000))
 #define PLATFORM_PLIC_NUM_SOURCES   1
-#define PLATFORM_HART_COUNT         1
+#define PLATFORM_HART_COUNT         8
 #define PLATFORM_CLINT_ADDR         0x2000000
 #define PLATFORM_ACLINT_MTIMER_FREQ 10000000
 #define PLATFORM_ACLINT_MSWI_ADDR   (PLATFORM_CLINT_ADDR + CLINT_MSWI_OFFSET)
@@ -33,7 +33,14 @@ static struct plic_data plic = {
     .size = PLATFORM_PLIC_SIZE,
     .num_src = PLATFORM_PLIC_NUM_SOURCES,
 	.context_map = {
-		[0] = { 0, 1 },
+		[0] = {  0,  1 },
+		[1] = {  2,  3 },
+		[2] = {  4,  5 },
+		[3] = {  6,  7 },
+		[4] = {  8,  9 },
+		[5] = { 10, 11 },
+		[6] = { 12, 13 },
+		[7] = { 14, 15 },
 	},
 };
 
@@ -117,8 +124,8 @@ const struct sbi_platform platform = {
     .platform_version   = SBI_PLATFORM_VERSION(0x0, 0x00),
     .name               = "isct,rvcpu",
     .features           = SBI_PLATFORM_DEFAULT_FEATURES,
-    .hart_count         = 1,
+    .hart_count         = PLATFORM_HART_COUNT,
     .hart_stack_size    = SBI_PLATFORM_DEFAULT_HART_STACK_SIZE,
-    .heap_size          = SBI_PLATFORM_DEFAULT_HEAP_SIZE(1),
+    .heap_size          = SBI_PLATFORM_DEFAULT_HEAP_SIZE(PLATFORM_HART_COUNT),
     .platform_ops_addr  = (unsigned long)&platform_ops
 };
