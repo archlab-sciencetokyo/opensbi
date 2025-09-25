@@ -1,3 +1,12 @@
+/*
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2025 Archlab, Science Tokyo
+ * 
+ * Authors:
+ *   Archlab, Science Tokyo
+ */
+
 #include <sbi/sbi_error.h>
 #include <sbi_utils/fdt/fdt_helper.h>
 #include <sbi_utils/serial/fdt_serial.h>
