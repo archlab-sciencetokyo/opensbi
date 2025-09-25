@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
 # Copyright (c) 2019 Western Digital Corporation or its affiliates.
+# Copyright (c) 2025 Archlab, Science Tokyo
 #
 # Authors:
 #   Anup Patel <anup.patel@wdc.com>
-#
+#   Archlab, Science Tokyo
 
 # Select Make Options:
 # o  Do not use make's built-in rules
