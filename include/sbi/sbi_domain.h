@@ -121,6 +121,9 @@ struct sbi_domain_memregion {
 		((__flags & SBI_DOMAIN_MEMREGION_SU_ACCESS_MASK)  &&	\
 		 !(__flags & SBI_DOMAIN_MEMREGION_M_ACCESS_MASK))
 
+#define SBI_DOMAIN_MEMREGION_IS_FIRMWARE(__flags)			\
+		((__flags & SBI_DOMAIN_MEMREGION_FW) ? true : false)	\
+
 /** Bit to control if permissions are enforced on all modes */
 #define SBI_DOMAIN_MEMREGION_ENF_PERMISSIONS	(1UL << 6)
 
@@ -157,8 +160,28 @@ struct sbi_domain_memregion {
 				 SBI_DOMAIN_MEMREGION_M_EXECUTABLE)
 
 #define SBI_DOMAIN_MEMREGION_MMIO		(1UL << 31)
+#define SBI_DOMAIN_MEMREGION_FW			(1UL << 30)
 	unsigned long flags;
 };
+
+/** Check if regionA is sub-region of regionB */
+static inline bool sbi_domain_memregion_is_subset(
+				const struct sbi_domain_memregion *regA,
+				const struct sbi_domain_memregion *regB)
+{
+	ulong regA_start = regA->base;
+	ulong regA_end = regA->base + (BIT(regA->order) - 1);
+	ulong regB_start = regB->base;
+	ulong regB_end = regB->base + (BIT(regB->order) - 1);
+
+	if ((regB_start <= regA_start) &&
+	    (regA_start < regB_end) &&
+	    (regB_start < regA_end) &&
+	    (regA_end <= regB_end))
+		return true;
+
+	return false;
+}
 
 /** Representation of OpenSBI domain */
 struct sbi_domain {
@@ -218,6 +241,9 @@ extern struct sbi_dlist domain_list;
 #define sbi_domain_for_each_memregion(__d, __r) \
 	for ((__r) = (__d)->regions; (__r)->order; (__r)++)
 
+#define sbi_domain_for_each_memregion_idx(__d, __r, __i) \
+	for ((__r) = (__d)->regions, (__i) = 0; (__r)->order; (__r)++, (__i)++)
+
 /**
  * Check whether given HART is assigned to specified domain
  * @param dom pointer to domain
@@ -248,6 +274,20 @@ void sbi_domain_memregion_init(unsigned long addr,
 				unsigned long size,
 				unsigned long flags,
 				struct sbi_domain_memregion *reg);
+
+/**
+ * Return the oldpmp pmpcfg LRWX encoding for the flags in @reg.
+ *
+ * @param reg pointer to memory region; its flags field encodes permissions.
+ */
+unsigned int sbi_domain_get_oldpmp_flags(struct sbi_domain_memregion *reg);
+
+/**
+ * Return the Smepmp pmpcfg LRWX encoding for the flags in @reg.
+ *
+ * @param reg pointer to memory region; its flags field encodes permissions.
+ */
+unsigned int sbi_domain_get_smepmp_flags(struct sbi_domain_memregion *reg);
 
 /**
  * Check whether we can access specified address for given mode and
@@ -307,8 +347,11 @@ int sbi_domain_register(struct sbi_domain *dom,
 int sbi_domain_root_add_memrange(unsigned long addr, unsigned long size,
 			   unsigned long align, unsigned long region_flags);
 
-/** Finalize domain tables and startup non-root domains */
-int sbi_domain_finalize(struct sbi_scratch *scratch, u32 cold_hartid);
+/** Startup non-root domains */
+int sbi_domain_startup(struct sbi_scratch *scratch, u32 cold_hartid);
+
+/** Finalize domain tables */
+int sbi_domain_finalize(struct sbi_scratch *scratch);
 
 /** Initialize domains */
 int sbi_domain_init(struct sbi_scratch *scratch, u32 cold_hartid);

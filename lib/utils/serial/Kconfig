@@ -54,11 +54,6 @@ config FDT_SERIAL_XILINX_UARTLITE
 	select SERIAL_XILINX_UARTLITE
 	default n
 
-config FDT_SERIAL_RVCPU
-	bool "Rvcpu UART FDT driver"
-	select SERIAL_RVCPU
-	default n
-
 endif
 
 config SERIAL_CADENCE
@@ -95,10 +90,6 @@ config SERIAL_XILINX_UARTLITE
 
 config SERIAL_SEMIHOSTING
 	bool "Semihosting support"
-	default n
-
-config SERIAL_RVCPU
-	bool "Rvcpu UART support"
 	default n
 
 endmenu

@@ -15,7 +15,11 @@ struct fdt_driver {
 	const struct fdt_match *match_table;
 	int (*init)(const void *fdt, int nodeoff,
 		    const struct fdt_match *match);
+	bool experimental;
 };
+
+/* List of early FDT drivers generated at compile time */
+extern const struct fdt_driver *const fdt_early_drivers[];
 
 /**
  * Initialize a driver instance for a specific DT node

@@ -15,7 +15,6 @@
 #include <sbi/sbi_domain.h>
 #include <sbi/sbi_error.h>
 #include <sbi/sbi_heap.h>
-#include <sbi/sbi_irqchip.h>
 #include <sbi/sbi_string.h>
 #include <sbi_utils/irqchip/plic.h>
 
@@ -136,8 +135,8 @@ void plic_suspend(void)
 	if (!data_word)
 		return;
 
-	for (u32 h = 0; h <= sbi_scratch_last_hartindex(); h++) {
-		u32 context_id = plic->context_map[h][PLIC_S_CONTEXT];
+	sbi_for_each_hartindex(h) {
+		s16 context_id = plic->context_map[h][PLIC_S_CONTEXT];
 
 		if (context_id < 0)
 			continue;
@@ -167,8 +166,8 @@ void plic_resume(void)
 	if (!data_word)
 		return;
 
-	for (u32 h = 0; h <= sbi_scratch_last_hartindex(); h++) {
-		u32 context_id = plic->context_map[h][PLIC_S_CONTEXT];
+	sbi_for_each_hartindex(h) {
+		s16 context_id = plic->context_map[h][PLIC_S_CONTEXT];
 
 		if (context_id < 0)
 			continue;
@@ -221,10 +220,6 @@ static int plic_warm_irqchip_init(struct sbi_irqchip_device *dev)
 	return 0;
 }
 
-static struct sbi_irqchip_device plic_device = {
-	.warm_init	= plic_warm_irqchip_init,
-};
-
 int plic_cold_irqchip_init(struct plic_data *plic)
 {
 	int i, ret;
@@ -241,7 +236,7 @@ int plic_cold_irqchip_init(struct plic_data *plic)
 	if (plic->flags & PLIC_FLAG_ENABLE_PM) {
 		unsigned long data_size = 0;
 
-		for (u32 i = 0; i <= sbi_scratch_last_hartindex(); i++) {
+		sbi_for_each_hartindex(i) {
 			if (plic->context_map[i][PLIC_S_CONTEXT] < 0)
 				continue;
 
@@ -275,7 +270,7 @@ int plic_cold_irqchip_init(struct plic_data *plic)
 	if (ret)
 		return ret;
 
-	for (u32 i = 0; i <= sbi_scratch_last_hartindex(); i++) {
+	sbi_for_each_hartindex(i) {
 		if (plic->context_map[i][PLIC_M_CONTEXT] < 0 &&
 		    plic->context_map[i][PLIC_S_CONTEXT] < 0)
 			continue;
@@ -284,7 +279,8 @@ int plic_cold_irqchip_init(struct plic_data *plic)
 	}
 
 	/* Register irqchip device */
-	sbi_irqchip_add_device(&plic_device);
+	plic->irqchip.warm_init = plic_warm_irqchip_init;
+	sbi_irqchip_add_device(&plic->irqchip);
 
 	return 0;
 }

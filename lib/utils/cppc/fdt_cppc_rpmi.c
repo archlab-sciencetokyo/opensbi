@@ -12,7 +12,7 @@
 #include <sbi/sbi_cppc.h>
 #include <sbi/sbi_ecall_interface.h>
 #include <sbi/sbi_scratch.h>
-#include <sbi_utils/cppc/fdt_cppc.h>
+#include <sbi_utils/fdt/fdt_driver.h>
 #include <sbi_utils/fdt/fdt_helper.h>
 #include <sbi_utils/mailbox/fdt_mailbox.h>
 #include <sbi_utils/mailbox/rpmi_mailbox.h>
@@ -59,6 +59,7 @@ static void rpmi_cppc_fc_db_trigger(struct rpmi_cppc *cppc)
 	u8 db_val_u8 = 0;
 	u16 db_val_u16 = 0;
 	u32 db_val_u32 = 0;
+	u64 db_val_u64 = 0;
 
 	switch (cppc->fc_db_width) {
 	case RPMI_CPPC_FAST_CHANNEL_DB_WIDTH_8:
@@ -84,24 +85,19 @@ static void rpmi_cppc_fc_db_trigger(struct rpmi_cppc *cppc)
 		break;
 	case RPMI_CPPC_FAST_CHANNEL_DB_WIDTH_64:
 #if __riscv_xlen != 32
-		u64 db_val_u64 = 0;
 		db_val_u64 = readq((void *)cppc->fc_db_addr);
 		db_val_u64 = cppc->fc_db_setmask |
 				(db_val_u64 & cppc->fc_db_preservemask);
 
 		writeq(db_val_u64, (void *)cppc->fc_db_addr);
 #else
-		u32 db_val_u32_hi = 0;
-		db_val_u32 = readl((void *)cppc->fc_db_addr);
-		db_val_u32_hi = readl((void *)(cppc->fc_db_addr + 4));
-
-		db_val_u32 = (u32)cppc->fc_db_setmask |
-				(db_val_u32 & (u32)cppc->fc_db_preservemask);
-		db_val_u32_hi = (u32)(cppc->fc_db_setmask >> 32) |
-				(db_val_u32 & (u32)(cppc->fc_db_preservemask >> 32));
-
-		writel(db_val_u32, (void *)cppc->fc_db_addr);
-		writel(db_val_u32_hi, (void *)(cppc->fc_db_addr + 4));
+		db_val_u64 = readl((void *)(cppc->fc_db_addr + 4));
+		db_val_u64 <<= 32;
+		db_val_u64 |= readl((void *)cppc->fc_db_addr);
+		db_val_u64 = cppc->fc_db_setmask |
+				(db_val_u64 & cppc->fc_db_preservemask);
+		writel(db_val_u64, (void *)cppc->fc_db_addr);
+		writel(db_val_u64 >> 32, (void *)(cppc->fc_db_addr + 4));
 #endif
 		break;
 	default:
@@ -371,7 +367,7 @@ static const struct fdt_match rpmi_cppc_match[] = {
 	{},
 };
 
-struct fdt_driver fdt_cppc_rpmi = {
+const struct fdt_driver fdt_cppc_rpmi = {
 	.match_table = rpmi_cppc_match,
 	.init = rpmi_cppc_cold_init,
 };

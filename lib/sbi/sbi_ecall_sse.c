@@ -56,6 +56,7 @@ static int sbi_ecall_sse_register_extensions(void)
 }
 
 struct sbi_ecall_extension ecall_sse = {
+	.name			= "sse",
 	.extid_start		= SBI_EXT_SSE,
 	.extid_end		= SBI_EXT_SSE,
 	.register_extensions	= sbi_ecall_sse_register_extensions,

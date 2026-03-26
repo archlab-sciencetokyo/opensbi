@@ -13,6 +13,7 @@
 #include <sbi/sbi_domain.h>
 #include <sbi/sbi_ecall_interface.h>
 #include <sbi/sbi_hart.h>
+#include <sbi/sbi_hart_protection.h>
 #include <sbi/sbi_heap.h>
 #include <sbi/sbi_platform.h>
 #include <sbi/sbi_pmu.h>
@@ -56,6 +57,14 @@ union sbi_pmu_ctr_info {
 #error "Can't handle firmware counters beyond BITS_PER_LONG"
 #endif
 
+/** HW event configuration parameters */
+struct sbi_pmu_hw_event_config {
+	/* event_data value from sbi_pmu_ctr_cfg_match() */
+	uint64_t event_data;
+	/* HW events flags from sbi_pmu_ctr_cfg_match() */
+	uint64_t flags;
+};
+
 /** Per-HART state of the PMU counters */
 struct sbi_pmu_hart_state {
 	/* HART to which this state belongs */
@@ -72,6 +81,12 @@ struct sbi_pmu_hart_state {
 	 * and hence can optimally share the same memory.
 	 */
 	uint64_t fw_counters_data[SBI_PMU_FW_CTR_MAX];
+	/* HW events configuration parameters from
+	 * sbi_pmu_ctr_cfg_match() command which are
+	 * used for restoring RAW hardware events after
+	 * cpu suspending.
+	 */
+	struct sbi_pmu_hw_event_config hw_counters_cfg[SBI_PMU_HW_CTR_MAX];
 };
 
 /** Offset of pointer to PMU HART state in scratch space */
@@ -206,6 +221,12 @@ static int pmu_ctr_validate(struct sbi_pmu_hart_state *phs,
 	return event_idx_type;
 }
 
+static bool pmu_ctr_idx_validate(unsigned long cbase, unsigned long cmask)
+{
+	/* Do a basic sanity check of counter base & mask */
+	return cmask && cbase + sbi_fls(cmask) < total_ctrs;
+}
+
 int sbi_pmu_ctr_fw_read(uint32_t cidx, uint64_t *cval)
 {
 	int event_idx_type;
@@ -293,8 +314,8 @@ reset_event:
  */
 int sbi_pmu_add_hw_event_counter_map(u32 eidx_start, u32 eidx_end, u32 cmap)
 {
-	if ((eidx_start > eidx_end) || eidx_start >= SBI_PMU_EVENT_RAW_V2_IDX ||
-	     eidx_end >= SBI_PMU_EVENT_RAW_V2_IDX)
+	if ((eidx_start > eidx_end) || eidx_start >= SBI_PMU_EVENT_RAW_IDX ||
+	     eidx_end >= SBI_PMU_EVENT_RAW_IDX)
 		return SBI_EINVAL;
 
 	return pmu_add_hw_event_map(eidx_start, eidx_end, cmap, 0, 0);
@@ -309,11 +330,11 @@ int sbi_pmu_add_raw_event_counter_map(uint64_t select, uint64_t select_mask, u32
 void sbi_pmu_ovf_irq()
 {
 	/*
-	 * We need to disable LCOFIP before returning to S-mode or we will loop
-	 * on LCOFIP being triggered
+	 * We need to disable the overflow irq before returning to S-mode or we will loop
+	 * on an irq being triggered
 	 */
-	csr_clear(CSR_MIE, MIP_LCOFIP);
-	sbi_sse_inject_event(SBI_SSE_EVENT_LOCAL_PMU);
+	csr_clear(CSR_MIE, sbi_pmu_irq_mask());
+	sbi_sse_inject_event(SBI_SSE_EVENT_LOCAL_PMU_OVERFLOW);
 }
 
 static int pmu_ctr_enable_irq_hw(int ctr_idx)
@@ -344,7 +365,7 @@ static int pmu_ctr_enable_irq_hw(int ctr_idx)
 	 * Otherwise, there will be race conditions where we may clear the bit
 	 * the software is yet to handle the interrupt.
 	 */
-	if (!(mip_val & MIP_LCOFIP)) {
+	if (!(mip_val & sbi_pmu_irq_mask())) {
 		mhpmevent_curr &= of_mask;
 		csr_write_num(mhpmevent_csr, mhpmevent_curr);
 	}
@@ -405,11 +426,21 @@ int sbi_pmu_irq_bit(void)
 	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
 
 	if (sbi_hart_has_extension(scratch, SBI_HART_EXT_SSCOFPMF))
-		return MIP_LCOFIP;
+		return IRQ_PMU_OVF;
 	if (pmu_dev && pmu_dev->hw_counter_irq_bit)
 		return pmu_dev->hw_counter_irq_bit();
 
-	return 0;
+	return -1;
+}
+
+unsigned long sbi_pmu_irq_mask(void)
+{
+	int irq_bit = sbi_pmu_irq_bit();
+
+	if (irq_bit < 0)
+		return 0;
+
+	return BIT(irq_bit);
 }
 
 static int pmu_ctr_start_fw(struct sbi_pmu_hart_state *phs,
@@ -422,12 +453,15 @@ static int pmu_ctr_start_fw(struct sbi_pmu_hart_state *phs,
 	    event_code > SBI_PMU_FW_PLATFORM)
 		return SBI_EINVAL;
 
+	if (phs->fw_counters_started & BIT(cidx - num_hw_ctrs))
+		return SBI_EALREADY_STARTED;
+
 	if (SBI_PMU_FW_PLATFORM == event_code) {
 		if (!pmu_dev ||
 		    !pmu_dev->fw_counter_write_value ||
 		    !pmu_dev->fw_counter_start) {
 			return SBI_EINVAL;
-		    }
+		}
 
 		if (ival_update)
 			pmu_dev->fw_counter_write_value(phs->hartid,
@@ -445,157 +479,6 @@ static int pmu_ctr_start_fw(struct sbi_pmu_hart_state *phs,
 	phs->fw_counters_started |= BIT(cidx - num_hw_ctrs);
 
 	return 0;
-}
-
-int sbi_pmu_ctr_start(unsigned long cbase, unsigned long cmask,
-		      unsigned long flags, uint64_t ival)
-{
-	struct sbi_pmu_hart_state *phs = pmu_thishart_state_ptr();
-
-	if (unlikely(!phs))
-		return SBI_EINVAL;
-
-	int event_idx_type;
-	uint32_t event_code;
-	int ret = SBI_EINVAL;
-	bool bUpdate = false;
-	int i, cidx;
-	uint64_t edata;
-
-	if ((cbase + sbi_fls(cmask)) >= total_ctrs)
-		return ret;
-
-	if (flags & SBI_PMU_STOP_FLAG_TAKE_SNAPSHOT)
-		return SBI_ENO_SHMEM;
-
-	if (flags & SBI_PMU_START_FLAG_SET_INIT_VALUE)
-		bUpdate = true;
-
-	for_each_set_bit(i, &cmask, BITS_PER_LONG) {
-		cidx = i + cbase;
-		event_idx_type = pmu_ctr_validate(phs, cidx, &event_code);
-		if (event_idx_type < 0)
-			/* Continue the start operation for other counters */
-			continue;
-		else if (event_idx_type == SBI_PMU_EVENT_TYPE_FW) {
-			edata = (event_code == SBI_PMU_FW_PLATFORM) ?
-				 phs->fw_counters_data[cidx - num_hw_ctrs]
-				 : 0x0;
-			ret = pmu_ctr_start_fw(phs, cidx, event_code, edata,
-					       ival, bUpdate);
-		}
-		else
-			ret = pmu_ctr_start_hw(cidx, ival, bUpdate);
-	}
-
-	return ret;
-}
-
-static int pmu_ctr_stop_hw(uint32_t cidx)
-{
-	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
-	unsigned long mctr_inhbt;
-
-	if (sbi_hart_priv_version(scratch) < SBI_HART_PRIV_VER_1_11)
-		return 0;
-
-	mctr_inhbt = csr_read(CSR_MCOUNTINHIBIT);
-
-	/* Make sure the counter index lies within the range and is not TM bit */
-	if (cidx >= num_hw_ctrs || cidx == 1)
-		return SBI_EINVAL;
-
-	if (!__test_bit(cidx, &mctr_inhbt)) {
-		__set_bit(cidx, &mctr_inhbt);
-		csr_write(CSR_MCOUNTINHIBIT, mctr_inhbt);
-		if (pmu_dev && pmu_dev->hw_counter_disable_irq) {
-			pmu_dev->hw_counter_disable_irq(cidx);
-		}
-		return 0;
-	} else
-		return SBI_EALREADY_STOPPED;
-}
-
-static int pmu_ctr_stop_fw(struct sbi_pmu_hart_state *phs,
-			   uint32_t cidx, uint32_t event_code)
-{
-	int ret;
-
-	if ((event_code >= SBI_PMU_FW_MAX &&
-	    event_code <= SBI_PMU_FW_RESERVED_MAX) ||
-	    event_code > SBI_PMU_FW_PLATFORM)
-		return SBI_EINVAL;
-
-	if (SBI_PMU_FW_PLATFORM == event_code &&
-	    pmu_dev && pmu_dev->fw_counter_stop) {
-		ret = pmu_dev->fw_counter_stop(phs->hartid, cidx - num_hw_ctrs);
-		if (ret)
-			return ret;
-	}
-
-	phs->fw_counters_started &= ~BIT(cidx - num_hw_ctrs);
-
-	return 0;
-}
-
-static int pmu_reset_hw_mhpmevent(int ctr_idx)
-{
-	if (ctr_idx < 3 || ctr_idx >= SBI_PMU_HW_CTR_MAX)
-		return SBI_EFAIL;
-#if __riscv_xlen == 32
-	csr_write_num(CSR_MHPMEVENT3 + ctr_idx - 3, 0);
-	if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
-				   SBI_HART_EXT_SSCOFPMF))
-		csr_write_num(CSR_MHPMEVENT3H + ctr_idx - 3, 0);
-#else
-	csr_write_num(CSR_MHPMEVENT3 + ctr_idx - 3, 0);
-#endif
-
-	return 0;
-}
-
-int sbi_pmu_ctr_stop(unsigned long cbase, unsigned long cmask,
-		     unsigned long flag)
-{
-	struct sbi_pmu_hart_state *phs = pmu_thishart_state_ptr();
-
-	if (unlikely(!phs))
-		return SBI_EINVAL;
-
-	int ret = SBI_EINVAL;
-	int event_idx_type;
-	uint32_t event_code;
-	int i, cidx;
-
-	if ((cbase + sbi_fls(cmask)) >= total_ctrs)
-		return SBI_EINVAL;
-
-	if (flag & SBI_PMU_STOP_FLAG_TAKE_SNAPSHOT)
-		return SBI_ENO_SHMEM;
-
-	for_each_set_bit(i, &cmask, BITS_PER_LONG) {
-		cidx = i + cbase;
-		event_idx_type = pmu_ctr_validate(phs, cidx, &event_code);
-		if (event_idx_type < 0)
-			/* Continue the stop operation for other counters */
-			continue;
-
-		else if (event_idx_type == SBI_PMU_EVENT_TYPE_FW)
-			ret = pmu_ctr_stop_fw(phs, cidx, event_code);
-		else
-			ret = pmu_ctr_stop_hw(cidx);
-
-		if (cidx > (CSR_INSTRET - CSR_CYCLE) && flag & SBI_PMU_STOP_FLAG_RESET) {
-			phs->active_events[cidx] = SBI_PMU_EVENT_IDX_INVALID;
-			pmu_reset_hw_mhpmevent(cidx);
-		}
-	}
-
-	/* Clear MIP_LCOFIP to avoid spurious interrupts */
-	if (phs->sse_enabled)
-		csr_clear(CSR_MIP, MIP_LCOFIP);
-
-	return ret;
 }
 
 static void pmu_update_inhibit_flags(unsigned long flags, uint64_t *mhpmevent_val)
@@ -651,6 +534,171 @@ static int pmu_update_hw_mhpmevent(struct sbi_pmu_hw_event *hw_evt, int ctr_idx,
 #endif
 
 	return 0;
+}
+
+int sbi_pmu_ctr_start(unsigned long cbase, unsigned long cmask,
+		      unsigned long flags, uint64_t ival)
+{
+	struct sbi_pmu_hart_state *phs = pmu_thishart_state_ptr();
+
+	if (unlikely(!phs))
+		return SBI_EINVAL;
+
+	int event_idx_type;
+	uint32_t event_code;
+	int ret = SBI_EINVAL;
+	bool bUpdate = false;
+	int i, cidx;
+	uint64_t edata;
+
+	if (!pmu_ctr_idx_validate(cbase, cmask))
+		return ret;
+
+	if (flags & SBI_PMU_STOP_FLAG_TAKE_SNAPSHOT)
+		return SBI_ENO_SHMEM;
+
+	if (flags & SBI_PMU_START_FLAG_SET_INIT_VALUE)
+		bUpdate = true;
+
+	for_each_set_bit(i, &cmask, BITS_PER_LONG) {
+		cidx = i + cbase;
+		event_idx_type = pmu_ctr_validate(phs, cidx, &event_code);
+		if (event_idx_type < 0)
+			/* Continue the start operation for other counters */
+			continue;
+		else if (event_idx_type == SBI_PMU_EVENT_TYPE_FW) {
+			edata = (event_code == SBI_PMU_FW_PLATFORM) ?
+				 phs->fw_counters_data[cidx - num_hw_ctrs]
+				 : 0x0;
+			ret = pmu_ctr_start_fw(phs, cidx, event_code, edata,
+					       ival, bUpdate);
+		} else {
+			if (cidx >= 3) {
+				struct sbi_pmu_hw_event_config *ev_cfg =
+					&phs->hw_counters_cfg[cidx];
+
+				ret = pmu_update_hw_mhpmevent(&hw_event_map[cidx], cidx,
+							ev_cfg->flags,
+							phs->active_events[cidx],
+							ev_cfg->event_data);
+				if (ret)
+					return ret;
+			}
+			ret = pmu_ctr_start_hw(cidx, ival, bUpdate);
+		}
+	}
+
+	return ret;
+}
+
+static int pmu_ctr_stop_hw(uint32_t cidx)
+{
+	struct sbi_scratch *scratch = sbi_scratch_thishart_ptr();
+	unsigned long mctr_inhbt;
+
+	if (sbi_hart_priv_version(scratch) < SBI_HART_PRIV_VER_1_11)
+		return 0;
+
+	mctr_inhbt = csr_read(CSR_MCOUNTINHIBIT);
+
+	/* Make sure the counter index lies within the range and is not TM bit */
+	if (cidx >= num_hw_ctrs || cidx == 1)
+		return SBI_EINVAL;
+
+	if (!__test_bit(cidx, &mctr_inhbt)) {
+		__set_bit(cidx, &mctr_inhbt);
+		csr_write(CSR_MCOUNTINHIBIT, mctr_inhbt);
+		if (pmu_dev && pmu_dev->hw_counter_disable_irq) {
+			pmu_dev->hw_counter_disable_irq(cidx);
+		}
+		return 0;
+	} else
+		return SBI_EALREADY_STOPPED;
+}
+
+static int pmu_ctr_stop_fw(struct sbi_pmu_hart_state *phs,
+			   uint32_t cidx, uint32_t event_code)
+{
+	int ret;
+
+	if ((event_code >= SBI_PMU_FW_MAX &&
+	    event_code <= SBI_PMU_FW_RESERVED_MAX) ||
+	    event_code > SBI_PMU_FW_PLATFORM)
+		return SBI_EINVAL;
+
+	if (!(phs->fw_counters_started & BIT(cidx - num_hw_ctrs)))
+		return SBI_EALREADY_STOPPED;
+
+	if (SBI_PMU_FW_PLATFORM == event_code &&
+	    pmu_dev && pmu_dev->fw_counter_stop) {
+		ret = pmu_dev->fw_counter_stop(phs->hartid, cidx - num_hw_ctrs);
+		if (ret)
+			return ret;
+	}
+
+	phs->fw_counters_started &= ~BIT(cidx - num_hw_ctrs);
+
+	return 0;
+}
+
+static int pmu_reset_hw_mhpmevent(int ctr_idx)
+{
+	if (ctr_idx < 3 || ctr_idx >= SBI_PMU_HW_CTR_MAX)
+		return SBI_EFAIL;
+#if __riscv_xlen == 32
+	csr_write_num(CSR_MHPMEVENT3 + ctr_idx - 3, 0);
+	if (sbi_hart_has_extension(sbi_scratch_thishart_ptr(),
+				   SBI_HART_EXT_SSCOFPMF))
+		csr_write_num(CSR_MHPMEVENT3H + ctr_idx - 3, 0);
+#else
+	csr_write_num(CSR_MHPMEVENT3 + ctr_idx - 3, 0);
+#endif
+
+	return 0;
+}
+
+int sbi_pmu_ctr_stop(unsigned long cbase, unsigned long cmask,
+		     unsigned long flag)
+{
+	struct sbi_pmu_hart_state *phs = pmu_thishart_state_ptr();
+
+	if (unlikely(!phs))
+		return SBI_EINVAL;
+
+	int ret = SBI_EINVAL;
+	int event_idx_type;
+	uint32_t event_code;
+	int i, cidx;
+
+	if (!pmu_ctr_idx_validate(cbase, cmask))
+		return ret;
+
+	if (flag & SBI_PMU_STOP_FLAG_TAKE_SNAPSHOT)
+		return SBI_ENO_SHMEM;
+
+	for_each_set_bit(i, &cmask, BITS_PER_LONG) {
+		cidx = i + cbase;
+		event_idx_type = pmu_ctr_validate(phs, cidx, &event_code);
+		if (event_idx_type < 0)
+			/* Continue the stop operation for other counters */
+			continue;
+
+		else if (event_idx_type == SBI_PMU_EVENT_TYPE_FW)
+			ret = pmu_ctr_stop_fw(phs, cidx, event_code);
+		else
+			ret = pmu_ctr_stop_hw(cidx);
+
+		if (cidx > (CSR_INSTRET - CSR_CYCLE) && flag & SBI_PMU_STOP_FLAG_RESET) {
+			phs->active_events[cidx] = SBI_PMU_EVENT_IDX_INVALID;
+			pmu_reset_hw_mhpmevent(cidx);
+		}
+	}
+
+	/* Clear PMU overflow interrupt to avoid spurious ones */
+	if (phs->sse_enabled)
+		csr_clear(CSR_MIP, sbi_pmu_irq_mask());
+
+	return ret;
 }
 
 static int pmu_fixed_ctr_update_inhibit_bits(int fixed_ctr, unsigned long flags)
@@ -722,12 +770,13 @@ static int pmu_ctr_find_hw(struct sbi_pmu_hart_state *phs,
 		return SBI_EINVAL;
 
 	/**
-	 * If Sscof is present try to find the programmable counter for
-	 * cycle/instret as well.
+	 * If Sscofpmf or Andes PMU is present, try to find
+	 * the programmable counter for cycle/instret as well.
 	 */
 	fixed_ctr = pmu_ctr_find_fixed_hw(event_idx);
 	if (fixed_ctr >= 0 &&
-	    !sbi_hart_has_extension(scratch, SBI_HART_EXT_SSCOFPMF))
+	    !sbi_hart_has_extension(scratch, SBI_HART_EXT_SSCOFPMF) &&
+	    !sbi_hart_has_extension(scratch, SBI_HART_EXT_XANDESPMU))
 		return pmu_fixed_ctr_update_inhibit_bits(fixed_ctr, flags);
 
 	if (sbi_hart_priv_version(scratch) >= SBI_HART_PRIV_VER_1_11)
@@ -763,6 +812,7 @@ static int pmu_ctr_find_hw(struct sbi_pmu_hart_state *phs,
 				continue;
 			/* We found a valid counter that is not started yet */
 			ctr_idx = cbase;
+			break;
 		}
 	}
 
@@ -800,7 +850,7 @@ static int pmu_ctr_find_fw(struct sbi_pmu_hart_state *phs,
 		cidx = i + cbase;
 		if (cidx < num_hw_ctrs || total_ctrs <= cidx)
 			continue;
-		if (phs->active_events[i] != SBI_PMU_EVENT_IDX_INVALID)
+		if (phs->active_events[cidx] != SBI_PMU_EVENT_IDX_INVALID)
 			continue;
 		if (SBI_PMU_FW_PLATFORM == event_code &&
 		    pmu_dev && pmu_dev->fw_counter_match_encoding) {
@@ -810,7 +860,7 @@ static int pmu_ctr_find_fw(struct sbi_pmu_hart_state *phs,
 				continue;
 		}
 
-		return i;
+		return cidx;
 	}
 
 	return SBI_ENOTSUPP;
@@ -828,8 +878,7 @@ int sbi_pmu_ctr_cfg_match(unsigned long cidx_base, unsigned long cidx_mask,
 	int ret, event_type, ctr_idx = SBI_ENOTSUPP;
 	u32 event_code;
 
-	/* Do a basic sanity check of counter base & mask */
-	if ((cidx_base + sbi_fls(cidx_mask)) >= total_ctrs)
+	if (!pmu_ctr_idx_validate(cidx_base, cidx_mask))
 		return SBI_EINVAL;
 
 	event_type = pmu_event_validate(phs, event_idx, event_data);
@@ -857,12 +906,20 @@ int sbi_pmu_ctr_cfg_match(unsigned long cidx_base, unsigned long cidx_mask,
 		/* Any firmware counter can be used track any firmware event */
 		ctr_idx = pmu_ctr_find_fw(phs, cidx_base, cidx_mask,
 					  event_code, event_data);
-		if (event_code == SBI_PMU_FW_PLATFORM)
+		if ((event_code == SBI_PMU_FW_PLATFORM) && (ctr_idx >= num_hw_ctrs))
 			phs->fw_counters_data[ctr_idx - num_hw_ctrs] =
 								event_data;
 	} else {
 		ctr_idx = pmu_ctr_find_hw(phs, cidx_base, cidx_mask, flags,
 					  event_idx, event_data);
+		if (ctr_idx >= 0) {
+			struct sbi_pmu_hw_event_config *ev_cfg =
+					&phs->hw_counters_cfg[ctr_idx];
+
+			ev_cfg->event_data = event_data;
+			/* Remove flags that are used in match call only */
+			ev_cfg->flags = flags & SBI_PMU_CFG_EVENT_MASK;
+		}
 	}
 
 	if (ctr_idx < 0)
@@ -1003,7 +1060,7 @@ int sbi_pmu_event_get_info(unsigned long shmem_phys_lo, unsigned long shmem_phys
 					 SBI_DOMAIN_READ | SBI_DOMAIN_WRITE))
 		return SBI_ERR_INVALID_ADDRESS;
 
-	sbi_hart_map_saddr(shmem_phys_lo, shmem_size);
+	sbi_hart_protection_map_range(shmem_phys_lo, shmem_size);
 
 	einfo = (struct sbi_pmu_event_info *)(shmem_phys_lo);
 	for (i = 0; i < num_events; i++) {
@@ -1014,20 +1071,19 @@ int sbi_pmu_event_get_info(unsigned long shmem_phys_lo, unsigned long shmem_phys
 		} else {
 			for (j = 0; j < num_hw_events; j++) {
 				temp = &hw_event_map[j];
-				if (temp->start_idx <= event_idx && event_idx <= temp->end_idx) {
-					found = true;
-					break;
-				}
 				/* For raw events, event data is used as the select value */
 				if (event_idx == SBI_PMU_EVENT_RAW_IDX ||
 					event_idx == SBI_PMU_EVENT_RAW_V2_IDX) {
-					uint64_t select_mask = temp->select_mask;
-
 					/* just match the selector */
-					if (temp->select == (einfo[i].event_data & select_mask)) {
+					if (temp->select == (einfo[i].event_data &
+									temp->select_mask)) {
 						found = true;
 						break;
 					}
+				} else if (temp->start_idx <= event_idx &&
+					   event_idx <= temp->end_idx) {
+					found = true;
+					break;
 				}
 			}
 			if (found)
@@ -1038,7 +1094,7 @@ int sbi_pmu_event_get_info(unsigned long shmem_phys_lo, unsigned long shmem_phys
 		}
 	}
 
-	sbi_hart_unmap_saddr();
+	sbi_hart_protection_unmap_range(shmem_phys_lo, shmem_size);
 
 	return 0;
 }
@@ -1087,30 +1143,43 @@ void sbi_pmu_exit(struct sbi_scratch *scratch)
 
 static void pmu_sse_enable(uint32_t event_id)
 {
-	struct sbi_pmu_hart_state *phs = pmu_thishart_state_ptr();
+	unsigned long irq_mask = sbi_pmu_irq_mask();
 
-	phs->sse_enabled = true;
-	csr_clear(CSR_MIDELEG, sbi_pmu_irq_bit());
-	csr_clear(CSR_MIP, MIP_LCOFIP);
-	csr_set(CSR_MIE, MIP_LCOFIP);
+	csr_set(CSR_MIE, irq_mask);
 }
 
 static void pmu_sse_disable(uint32_t event_id)
 {
-	struct sbi_pmu_hart_state *phs = pmu_thishart_state_ptr();
+	unsigned long irq_mask = sbi_pmu_irq_mask();
 
-	csr_clear(CSR_MIE, MIP_LCOFIP);
-	csr_clear(CSR_MIP, MIP_LCOFIP);
-	csr_set(CSR_MIDELEG, sbi_pmu_irq_bit());
-	phs->sse_enabled = false;
+	csr_clear(CSR_MIE, irq_mask);
+	csr_clear(CSR_MIP, irq_mask);
 }
 
 static void pmu_sse_complete(uint32_t event_id)
 {
-	csr_set(CSR_MIE, MIP_LCOFIP);
+	csr_set(CSR_MIE, sbi_pmu_irq_mask());
+}
+
+static void pmu_sse_register(uint32_t event_id)
+{
+	struct sbi_pmu_hart_state *phs = pmu_thishart_state_ptr();
+
+	phs->sse_enabled = true;
+	csr_clear(CSR_MIDELEG, sbi_pmu_irq_mask());
+}
+
+static void pmu_sse_unregister(uint32_t event_id)
+{
+	struct sbi_pmu_hart_state *phs = pmu_thishart_state_ptr();
+
+	phs->sse_enabled = false;
+	csr_set(CSR_MIDELEG, sbi_pmu_irq_mask());
 }
 
 static const struct sbi_sse_cb_ops pmu_sse_cb_ops = {
+	.register_cb = pmu_sse_register,
+	.unregister_cb = pmu_sse_unregister,
 	.enable_cb = pmu_sse_enable,
 	.disable_cb = pmu_sse_disable,
 	.complete_cb = pmu_sse_complete,
@@ -1153,9 +1222,10 @@ int sbi_pmu_init(struct sbi_scratch *scratch, bool cold_boot)
 			return SBI_EINVAL;
 
 		total_ctrs = num_hw_ctrs + SBI_PMU_FW_CTR_MAX;
-	}
 
-	sbi_sse_set_cb_ops(SBI_SSE_EVENT_LOCAL_PMU, &pmu_sse_cb_ops);
+		if (sbi_pmu_irq_bit() >= 0)
+			sbi_sse_add_event(SBI_SSE_EVENT_LOCAL_PMU_OVERFLOW, &pmu_sse_cb_ops);
+	}
 
 	phs = pmu_get_hart_state_ptr(scratch);
 	if (!phs) {
